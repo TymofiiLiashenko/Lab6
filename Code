@@ -1,0 +1,213 @@
+from flask import Flask, g, render_template_string, request, redirect, url_for, flash
+import sqlite3
+import os
+
+DATABASE = "demo_users.db"
+app = Flask(__name__)
+app.secret_key = "dev-demo-key"  # для flash повідомлень
+
+# ---------- DB helpers ----------
+def get_db():
+    db = getattr(g, "_database", None)
+    if db is None:
+        need_init = not os.path.exists(DATABASE)
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        g._database = db
+        if need_init:
+            init_db(db)
+    return db
+
+def init_db(db):
+    cur = db.cursor()
+    cur.executescript("""
+    DROP TABLE IF EXISTS students;
+    CREATE TABLE students (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        group_name TEXT
+    );
+    -- наповнимо демонстраційними персональними даними
+    INSERT INTO students (name, email, group_name) VALUES
+      ('Іван Петренко', 'ivan.petrenko@example.com', 'CS101'),
+      ('Марія Коваленко', 'maria.k@example.com', 'CS102'),
+      ('Петро Іванов', 'petro.ivanov@example.com', 'CS101'),
+      ('Олена Тимошенко', 'olena.t@example.com', 'CS103');
+    """)
+    db.commit()
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, "_database", None)
+    if db:
+        db.close()
+
+# ---------- Templates (вбудовані для простоти) ----------
+BASE = """
+<!doctype html>
+<title>SQLi Demo</title>
+<h1>SQL Injection: Demo (вразлива vs захищена)</h1>
+<p>
+  <a href="{{ url_for('index') }}">Головна</a> |
+  <a href="{{ url_for('search_vulnerable') }}">Пошук (вразливий)</a> |
+  <a href="{{ url_for('search_safe') }}">Пошук (захищений)</a> |
+  <a href="{{ url_for('login_vulnerable') }}">Авторизація (вразлива)</a> |
+  <a href="{{ url_for('login_safe') }}">Авторизація (захищена)</a>
+</p>
+<hr>
+{% with messages = get_flashed_messages() %}
+  {% if messages %}
+    <ul style="color: red;">
+    {% for m in messages %}<li>{{ m }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+{{ body|safe }}
+<hr>
+<small>Локальна демонстрація. Не застосовувати техніки на реальних ресурсах.</small>
+"""
+
+INDEX_BODY = """
+<h2>Опис</h2>
+<p>Цей демонстраційний додаток показує два приклади одного функціоналу:
+<ul>
+<li><b>Вразлива</b> реалізація — небезпечне конкатенування рядків у SQL.</li>
+<li><b>Захищена</b> реалізація — параметризовані запити (prepared statements).</li>
+</ul>
+Тут використовується локальна SQLite база з тестовими «персональними даними» студентів.</p>
+<p>Перейдіть у розділ «Пошук» або «Авторизація» і спробуйте ввести</p>
+<pre> ' OR '1'='1 </pre>
+щоб побачити, як працює атака у вразливій версії, та як вона блокується у захищеній.</p>
+"""
+
+# ---------- Вразлива пошукова форма ----------
+@app.route("/")
+def index():
+    return render_template_string(BASE, body=INDEX_BODY)
+
+@app.route("/search_vuln", methods=["GET", "POST"])
+def search_vulnerable():
+    body = """
+    <h2>Пошук студентів (ВРАЗЛИВА версія)</h2>
+    <form method="post">
+      Пошуковий рядок (name або email): <input name="q" size="40">
+      <input type="submit" value="Пошук">
+    </form>
+    <p>Примітка: тут SQL будується шляхом конкатенації рядків — вразливо до інʼєкцій.</p>
+    """
+    results = None
+    if request.method == "POST":
+        q = request.form.get("q", "")
+        db = get_db()
+        cur = db.cursor()
+        # !!! Увага: НЕ робіть так в реальному коді !!!
+        sql = f"SELECT id, name, email, group_name FROM students WHERE name LIKE '%{q}%' OR email LIKE '%{q}%'"
+        try:
+            cur.execute(sql)
+            results = cur.fetchall()
+        except Exception as e:
+            flash(f"DB error: {e}")
+    if results is None:
+        results_html = ""
+    else:
+        if len(results) == 0:
+            results_html = "<p><i>Нічого не знайдено</i></p>"
+        else:
+            rows = "".join(f"<tr><td>{r['id']}</td><td>{r['name']}</td><td>{r['email']}</td><td>{r['group_name']}</td></tr>" for r in results)
+            results_html = "<table border=1 cellpadding=4><tr><th>id</th><th>name</th><th>email</th><th>group</th></tr>" + rows + "</table>"
+    return render_template_string(BASE, body=body + results_html)
+
+# ---------- Захищена пошукова форма (параметризований запит) ----------
+@app.route("/search_safe", methods=["GET", "POST"])
+def search_safe():
+    body = """
+    <h2>Пошук студентів (ЗАХИЩЕНА версія)</h2>
+    <form method="post">
+      Пошуковий рядок (name або email): <input name="q" size="40">
+      <input type="submit" value="Пошук">
+    </form>
+    <p>Тут використані параметризовані запити (prepared statements) — не вразливо до SQLi.</p>
+    """
+    results = None
+    if request.method == "POST":
+        q = request.form.get("q", "")
+        db = get_db()
+        cur = db.cursor()
+        # БЕЗПЕЧНО: використовуємо аргументи, не конкатенуємо
+        pattern = f"%{q}%"
+        cur.execute("SELECT id, name, email, group_name FROM students WHERE name LIKE ? OR email LIKE ?", (pattern, pattern))
+        results = cur.fetchall()
+    if results is None:
+        results_html = ""
+    else:
+        if len(results) == 0:
+            results_html = "<p><i>Нічого не знайдено</i></p>"
+        else:
+            rows = "".join(f"<tr><td>{r['id']}</td><td>{r['name']}</td><td>{r['email']}</td><td>{r['group_name']}</td></tr>" for r in results)
+            results_html = "<table border=1 cellpadding=4><tr><th>id</th><th>name</th><th>email</th><th>group</th></tr>" + rows + "</table>"
+    return render_template_string(BASE, body=body + results_html)
+
+# ---------- Вразлива авторизація ----------
+@app.route("/login_vuln", methods=["GET", "POST"])
+def login_vulnerable():
+    body = """
+    <h2>Авторизація (ВРАЗЛИВА версія)</h2>
+    <form method="post">
+      Email: <input name="email" size="30"><br>
+      Ключ (password): <input name="password" size="30"><br>
+      <input type="submit" value="Login">
+    </form>
+    <p>У вразливій версії введені поля підставляються прямо в SQL.</p>
+    """
+    message = ""
+    if request.method == "POST":
+        email = request.form.get("email","")
+        password = request.form.get("password","")
+        db = get_db()
+        cur = db.cursor()
+        # УВАГА: вразлива конкатенація рядків
+        sql = f"SELECT id, name FROM students WHERE email = '{email}' AND name = '{password}' LIMIT 1"
+        # (в демо ми зберігаємо "пароль" як name для спрощення)
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+            if row:
+                message = f"<p style='color:green'>Welcome, {row['name']} (id={row['id']})</p>"
+            else:
+                message = "<p style='color:orange'>Login failed</p>"
+        except Exception as e:
+            flash(f"DB error: {e}")
+    return render_template_string(BASE, body=body + message)
+
+# ---------- Захищена авторизація ----------
+@app.route("/login_safe", methods=["GET", "POST"])
+def login_safe():
+    body = """
+    <h2>Авторизація (ЗАХИЩЕНА версія)</h2>
+    <form method="post">
+      Email: <input name="email" size="30"><br>
+      Ключ (password): <input name="password" size="30"><br>
+      <input type="submit" value="Login">
+    </form>
+    <p>Тут використано параметризовані запити.</p>
+    """
+    message = ""
+    if request.method == "POST":
+        email = request.form.get("email","")
+        password = request.form.get("password","")
+        db = get_db()
+        cur = db.cursor()
+        # БЕЗПЕЧНО: параметри через плейсхолдери
+        cur.execute("SELECT id, name FROM students WHERE email = ? AND name = ? LIMIT 1", (email, password))
+        row = cur.fetchone()
+        if row:
+            message = f"<p style='color:green'>Welcome, {row['name']} (id={row['id']})</p>"
+        else:
+            message = "<p style='color:orange'>Login failed</p>"
+    return render_template_string(BASE, body=body + message)
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    # ініціалізація DB при першому старті (якщо треба) відбувається у get_db()
+    app.run(debug=True)
